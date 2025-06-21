@@ -1,0 +1,537 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define BUTTON_PIN 15 // D15 for button
+
+// WiFi Configuration
+const char* ssid = "Harsha's Realme";
+const char* password = "hahahehe";
+WebServer server(80);
+
+// OLED Display Settings
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// MPU6050 Sensor
+Adafruit_MPU6050 mpu;
+
+// Step Counting Variables
+int stepCount = 0;
+float prevY = 0;
+float prevZ = 0;
+bool stepDetected = false;
+float yThreshold = 0.8; // Threshold for Y-axis (forward/backward movement)
+float zThreshold = 0.3; // Threshold for Z-axis (up/down movement)
+float lastAccY = 0;
+bool inSwingPhase = false;
+unsigned long lastStepTime = 0;
+const unsigned long MIN_STEP_INTERVAL = 300;
+// Exercise Configuration Structure
+struct ExerciseConfig {
+  String name;
+  int sets;
+  int reps;
+  int restTime;
+  int detectionType; // 0-4 corresponding to enum Exercise
+};
+
+ExerciseConfig workout[3];
+int currentExerciseIndex = 0;
+int currentSet = 1;
+int currentRep = 0;
+unsigned long restStartTime = 0;
+unsigned long lastRepTime = 0;
+
+// Workout States
+enum State { CONFIGURING, READY, WORKING, RESTING, COMPLETE, STEP_COUNTING };
+State workoutState = CONFIGURING;
+
+// Exercise Types
+enum Exercise {
+  BICEP_CURL,
+  DEADLIFT,
+  SQUAT,
+  LATERAL_RAISE,
+  SHOULDER_PRESS
+};
+
+const char* exerciseNames[] = {
+  "Bicep Curl", "Deadlift", "Squat", 
+  "Lateral Raise", "Shoulder Press"
+};
+
+// Button handling variables
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 250; // Debounce time in milliseconds
+int buttonState = HIGH;
+int lastButtonState = HIGH;
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  // Set up button pin with internal pull-up resistor
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Initialize MPU6050
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found!");
+    while (1);
+  }
+
+  // Initialize OLED Display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed!");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.display();
+
+  // Set up WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected. IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Display the IP address on OLED
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("WiFi connected");
+  display.print("IP: ");
+  display.println(WiFi.localIP());
+  display.display();
+
+  // Set up Web Server Routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/submit", HTTP_POST, handleSubmit);
+  server.begin();
+  
+  // Start in step counting mode
+  workoutState = STEP_COUNTING;
+}
+
+void loop() {
+  server.handleClient();
+  
+  // Handle button press to toggle between workout and step counting
+  handleButton();
+  
+  // Handle the current state
+  switch(workoutState) {
+    case READY:
+      displayWaitingScreen();
+      break;
+    case WORKING:
+      handleWorkout();
+      break;
+    case RESTING:
+      handleRest();
+      break;
+    case COMPLETE:
+      displayComplete();
+      break;
+    case STEP_COUNTING:
+      handleStepCounting();
+      break;
+    case CONFIGURING:
+      // Do nothing, waiting for configuration
+      break;
+  }
+}
+
+void handleButton() {
+  // Read button state (LOW when pressed due to pull-up)
+  int reading = digitalRead(BUTTON_PIN);
+
+  // Check if button state changed
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  // If button state has been stable for the debounce period
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    // If the button state has changed
+    if (reading != buttonState) {
+      buttonState = reading;
+      
+      // If button is pressed (LOW due to pull-up)
+      if (buttonState == LOW) {
+        toggleWorkoutMode();
+      }
+    }
+  }
+  
+  lastButtonState = reading;
+}
+
+void toggleWorkoutMode() {
+  Serial.println("Button pressed - toggling mode");
+  
+  if (workoutState == READY) {
+    // Start workout
+    workoutState = WORKING;
+    currentExerciseIndex = 0;
+    currentSet = 1;
+    currentRep = 0;
+    updateDisplay();
+    Serial.println("Starting workout");
+  } 
+  else if (workoutState == WORKING || workoutState == RESTING) {
+    // Pause workout and go to step counting
+    workoutState = STEP_COUNTING;
+    Serial.println("Switching to step counting");
+  }
+  else if (workoutState == STEP_COUNTING && workout[0].name.length() > 0) {
+    // If workout is configured, resume it
+    workoutState = READY;
+    Serial.println("Switching to workout mode");
+  }
+}
+
+void handleStepCounting() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  
+  // Get Y axis acceleration
+  float accY = a.acceleration.y;
+  unsigned long currentTime = millis();
+  
+  // Detect forward swing (acceleration increases significantly from resting position)
+  if (!inSwingPhase && accY > -6.0 && 
+      (currentTime - lastStepTime > MIN_STEP_INTERVAL)) {
+    // Forward swing detected
+    inSwingPhase = true;
+    stepCount++;
+    lastStepTime = currentTime;
+  }
+  
+  // Reset detection when arm returns to neutral or backward position
+  if (inSwingPhase && accY < -9.0) {
+    inSwingPhase = false;
+  }
+  
+  // Display the step count on OLED
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Step Counting Mode");
+  display.print("Steps: ");
+  display.println(stepCount);
+  display.display();
+  
+  delay(50); // Shorter delay for better responsiveness
+}
+
+void handleWorkout() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  bool repCompleted = false;
+  ExerciseConfig currentEx = workout[currentExerciseIndex];
+
+  switch(currentEx.detectionType) {
+    case BICEP_CURL: repCompleted = detectBicepCurl(a); break;
+    case DEADLIFT: repCompleted = detectDeadlift(a); break;
+    case SQUAT: repCompleted = detectSquat(a); break;
+    case LATERAL_RAISE: repCompleted = detectLateralRaise(g); break;
+    case SHOULDER_PRESS: repCompleted = detectShoulderPress(g); break;
+  }
+
+  if(repCompleted) {
+    currentRep++;
+    updateDisplay();
+
+    if(currentRep >= currentEx.reps) {
+      currentSet++;
+      currentRep = 0;
+
+      if(currentSet > currentEx.sets) {
+        currentExerciseIndex++;
+        if(currentExerciseIndex >= 3) {
+          workoutState = COMPLETE;
+        } else {
+          currentSet = 1;
+          workoutState = RESTING;
+          restStartTime = millis();
+        }
+      } else {
+        workoutState = RESTING;
+        restStartTime = millis();
+      }
+      updateDisplay();
+    }
+  }
+}
+
+void handleRest() {
+  ExerciseConfig currentEx = workout[currentExerciseIndex];
+  unsigned long elapsed = (millis() - restStartTime) / 1000;
+  
+  if(elapsed >= currentEx.restTime) {  // Use exercise-specific rest time
+    workoutState = WORKING;
+    updateDisplay();
+  } else {
+    displayRestScreen(elapsed);
+  }
+}
+
+void updateDisplay() {
+  ExerciseConfig currentEx = workout[currentExerciseIndex];
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  
+  display.println(currentEx.name);  // Use configured exercise name
+  display.print("Set: ");
+  display.print(currentSet);
+  display.print("/");
+  display.println(currentEx.sets);  // Use exercise-specific sets
+  
+  display.print("Rep: ");
+  display.print(currentRep);
+  display.print("/");
+  display.println(currentEx.reps);  // Use exercise-specific reps
+
+  display.display();
+}
+
+void displayRestScreen(unsigned long elapsed) {
+  ExerciseConfig currentEx = workout[currentExerciseIndex];
+  
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("REST");
+  display.print("Next set in: ");
+  display.print(currentEx.restTime - elapsed);  // Use exercise-specific rest time
+  display.println("s");
+  display.display();
+}
+
+void displayWaitingScreen() {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Waiting for workout");
+  display.println("Press button to start");
+  display.display();
+  delay(100);
+}
+
+void displayComplete() {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.println("Workout Complete!");
+  display.display();
+  delay(3000); // Display message for 3 seconds before returning to step counting mode
+  workoutState = STEP_COUNTING; // Go back to step counting, without resetting the step count
+}
+
+// Web Server Handlers
+void handleRoot() {
+  String html = "<html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 20px; }";
+  html += "h1 { color: #0066cc; }";
+  html += ".exercise { background-color: #f2f2f2; padding: 15px; margin-bottom: 15px; border-radius: 5px; }";
+  html += "select, input { width: 100%; padding: 8px; margin: 5px 0 15px 0; display: inline-block; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }";
+  html += "input[type=submit] { background-color: #4CAF50; color: white; padding: 12px 20px; border: none; cursor: pointer; }";
+  html += "input[type=submit]:hover { background-color: #45a049; }";
+  html += "</style></head><body>";
+  html += "<h1>Workout Setup</h1>";
+  html += "<form action='/submit' method='POST'>";
+  
+  for (int i = 0; i < 3; i++) {
+    html += "<div class='exercise'>";
+    html += "<h3>Exercise " + String(i+1) + "</h3>";
+    html += "<label>Exercise Type:</label>";
+    html += "<select name='exercise" + String(i) + "' required>";
+    html += "<option value='0'>Bicep Curl</option>";
+    html += "<option value='1'>Deadlift</option>";
+    html += "<option value='2'>Squat</option>";
+    html += "<option value='3'>Lateral Raise</option>";
+    html += "<option value='4'>Shoulder Press</option>";
+    html += "</select><br>";
+    
+    html += "<label>Sets:</label>";
+    html += "<input type='number' name='sets" + String(i) + "' min='1' max='10' required><br>";
+    
+    html += "<label>Reps:</label>";
+    html += "<input type='number' name='reps" + String(i) + "' min='1' max='50' required><br>";
+    
+    html += "<label>Rest Time (seconds):</label>";
+    html += "<input type='number' name='rest" + String(i) + "' min='5' max='300' required><br>";
+    html += "</div>";
+  }
+
+  html += "<input type='submit' value='Start Workout'>";
+  html += "</form></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSubmit() {
+  // Store configuration
+  for(int i = 0; i < 3; i++) {
+    int type = server.arg("exercise" + String(i)).toInt();
+    workout[i] = {
+      exerciseNames[type],
+      server.arg("sets" + String(i)).toInt(),
+      server.arg("reps" + String(i)).toInt(),
+      server.arg("rest" + String(i)).toInt(),
+      type
+    };
+  }
+
+  String confirmationHtml = "<html><head>";
+  confirmationHtml += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  confirmationHtml += "<style>";
+  confirmationHtml += "body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }";
+  confirmationHtml += "h1 { color: #0066cc; }";
+  confirmationHtml += "p { font-size: 18px; }";
+  confirmationHtml += ".success { color: #4CAF50; font-weight: bold; }";
+  confirmationHtml += ".instructions { background-color: #f2f2f2; padding: 15px; margin: 20px 0; border-radius: 5px; text-align: left; }";
+  confirmationHtml += "</style></head><body>";
+  confirmationHtml += "<h1>Workout Configured!</h1>";
+  confirmationHtml += "<p class='success'>Your workout has been stored in the device.</p>";
+  confirmationHtml += "<div class='instructions'>";
+  confirmationHtml += "<p><strong>Next steps:</strong></p>";
+  confirmationHtml += "<ol>";
+  confirmationHtml += "<li>The device display now shows 'Waiting for workout...'</li>";
+  confirmationHtml += "<li>Press the physical button (D15) to start the workout</li>";
+  confirmationHtml += "<li>You can press the button again any time to switch between workout mode and step counting mode</li>";
+  confirmationHtml += "</ol>";
+  confirmationHtml += "</div>";
+  confirmationHtml += "</body></html>";
+  
+  server.send(200, "text/html", confirmationHtml);
+  
+  // Set to waiting state instead of immediately starting workout
+  workoutState = READY;
+  currentExerciseIndex = 0;
+  currentSet = 1;
+  currentRep = 0;
+}
+
+bool detectBicepCurl(sensors_event_t a) {
+  const float UP_THRESHOLD = 3.0;
+  const float DOWN_THRESHOLD = -3.0;
+  static bool repInProgress = false;
+
+  if(a.acceleration.z > UP_THRESHOLD && !repInProgress) {
+    repInProgress = true;
+  }
+  if(a.acceleration.z < DOWN_THRESHOLD && repInProgress) {
+    repInProgress = false;
+    return true;
+  }
+  return false;
+}
+
+bool detectDeadlift(sensors_event_t a) {
+  const float LIFT_THRESHOLD = -9.0;
+  const float LOWER_THRESHOLD = -12.0;
+  static bool liftDetected = false;
+  static unsigned long lastRepTime = 0;
+  const unsigned long MIN_REP_INTERVAL = 800; // Prevent double counting
+  
+  // Debug print (before any return statements)
+  Serial.print("Deadlift Y-axis: ");
+  Serial.println(a.acceleration.y);
+  
+  // Only detect one movement direction
+  if(a.acceleration.y > LIFT_THRESHOLD && !liftDetected) {
+    liftDetected = true;
+  }
+  
+  // Require minimum time between reps
+  if(a.acceleration.y < LOWER_THRESHOLD && liftDetected && 
+     (millis() - lastRepTime > MIN_REP_INTERVAL)) {
+    liftDetected = false;
+    lastRepTime = millis();
+    return true;  // Completed deadlift rep
+  }
+  
+  return false;
+}
+
+bool detectSquat(sensors_event_t a) {
+  const float SQUAT_DOWN_THRESHOLD = 3.0;  // Adjust based on your readings
+  const float SQUAT_UP_THRESHOLD = 6.0;    // Adjust based on your readings
+  static bool squatDown = false;
+  static unsigned long lastRepTime = 0;
+  const unsigned long MIN_REP_INTERVAL = 800;
+  
+  // Debug print
+  Serial.print("Squat Y-axis: ");
+  Serial.println(a.acceleration.y);
+  
+  // Detect downward movement
+  if(a.acceleration.y < SQUAT_DOWN_THRESHOLD && !squatDown) {
+    squatDown = true;
+  }
+  
+  // Detect upward movement after squat
+  if(a.acceleration.y > SQUAT_UP_THRESHOLD && squatDown && 
+     (millis() - lastRepTime > MIN_REP_INTERVAL)) {
+    squatDown = false;
+    lastRepTime = millis();
+    return true;  // Completed squat rep
+  }
+  
+  return false;
+}
+
+bool detectShoulderPress(sensors_event_t g) {
+  // Using acceleration instead of gyro might be better for shoulder press
+  const float PRESS_UP_THRESHOLD = 2.0;     // Adjust based on your readings
+  const float PRESS_DOWN_THRESHOLD = -1.0;  // Adjust based on your readings
+  static bool pressUp = false;
+  static unsigned long lastPressTime = 0;
+  const unsigned long MIN_REP_INTERVAL = 1000;
+  
+  // Debug print
+  Serial.print("Shoulder Press Y gyro: ");
+  Serial.println(g.gyro.y * RAD_TO_DEG);  // Changed to y-axis and added conversion
+  
+  // Detect upward movement (press)
+  if(g.gyro.y * RAD_TO_DEG > PRESS_UP_THRESHOLD && !pressUp && 
+     (millis() - lastPressTime > MIN_REP_INTERVAL)) {
+    pressUp = true;
+  }
+  
+  // Detect downward movement (return)
+  if(g.gyro.y * RAD_TO_DEG < PRESS_DOWN_THRESHOLD && pressUp) {
+    pressUp = false;
+    lastPressTime = millis();
+    return true;
+  }
+  
+  return false;
+}
+
+bool detectLateralRaise(sensors_event_t g) {
+  const float RAISE_THRESHOLD = 100.0;
+  const float RETURN_THRESHOLD = -80.0;
+  static bool raiseDetected = false;
+  float gyroX = g.gyro.x * RAD_TO_DEG;
+
+  if(gyroX > RAISE_THRESHOLD && !raiseDetected) {
+    raiseDetected = true;
+  }
+  if(gyroX < RETURN_THRESHOLD && raiseDetected) {
+    raiseDetected = false;
+    return true;
+  }
+  return false;
+}
